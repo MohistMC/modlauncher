@@ -27,6 +27,7 @@ import org.apache.logging.log4j.Logger;
 
 import javax.annotation.Nullable;
 import java.io.*;
+import java.lang.reflect.Method;
 import java.net.*;
 import java.nio.file.*;
 import java.security.CodeSource;
@@ -50,6 +51,14 @@ public class TransformingClassLoader extends ClassLoader implements ITransformin
         ClassLoader.registerAsParallelCapable();
     }
 
+    // Mohist start - Allow to load classes from child classloaders
+    private List<ClassLoader> child;
+
+    public void addChild(ClassLoader child) {
+        this.child.add(child);
+    }
+    // Mohist end
+
     private static final List<String> SKIP_PACKAGE_PREFIXES = Arrays.asList(
             "java.", "javax.", "org.objectweb.asm.", "org.apache.logging.log4j."
     );
@@ -57,12 +66,12 @@ public class TransformingClassLoader extends ClassLoader implements ITransformin
     private final DelegatedClassLoader delegatedClassLoader;
     private final URL[] specialJars;
     private final Function<URLConnection, Manifest> manifestFinder;
-    private Function<String,Enumeration<URL>> resourceFinder;
+    private Function<String, Enumeration<URL>> resourceFinder;
     private Predicate<String> targetPackageFilter;
 
     public TransformingClassLoader(TransformStore transformStore, LaunchPluginHandler pluginHandler, Path... paths) {
         this.classTransformer = new ClassTransformer(transformStore, pluginHandler, this);
-        this.specialJars = Arrays.stream(paths).map(rethrowFunction(path->path.toUri().toURL())).toArray(URL[]::new);
+        this.specialJars = Arrays.stream(paths).map(rethrowFunction(path -> path.toUri().toURL())).toArray(URL[]::new);
         this.delegatedClassLoader = new DelegatedClassLoader(this);
         this.targetPackageFilter = s -> SKIP_PACKAGE_PREFIXES.stream().noneMatch(s::startsWith);
         this.resourceFinder = this::locateResource;
@@ -72,20 +81,22 @@ public class TransformingClassLoader extends ClassLoader implements ITransformin
     TransformingClassLoader(TransformStore transformStore, LaunchPluginHandler pluginHandler, TransformingClassLoaderBuilder builder, final Environment environment) {
         super();
         TransformerAuditTrail tat = new TransformerAuditTrail();
-        environment.computePropertyIfAbsent(IEnvironment.Keys.AUDITTRAIL.get(), v->tat);
+        environment.computePropertyIfAbsent(IEnvironment.Keys.AUDITTRAIL.get(), v -> tat);
         this.classTransformer = new ClassTransformer(transformStore, pluginHandler, this, tat);
         this.specialJars = builder.getSpecialJarsAsURLs();
         this.delegatedClassLoader = new DelegatedClassLoader(this);
         this.targetPackageFilter = s -> SKIP_PACKAGE_PREFIXES.stream().noneMatch(s::startsWith);
         this.resourceFinder = EnumerationHelper.mergeFunctors(builder.getResourceEnumeratorLocator(), this::locateResource);
         this.manifestFinder = alternate(builder.getManifestLocator(), this::findManifest);
+        this.child = new ArrayList<>();
     }
 
-    private static <I, R> Function<I,R> alternate(@Nullable Function<I, Optional<R>> first, @Nullable Function<I, Optional<R>> second) {
-        if (second == null) return input-> first.apply(input).orElse(null);
-        if (first == null) return input-> second.apply(input).orElse(null);
+    private static <I, R> Function<I, R> alternate(@Nullable Function<I, Optional<R>> first, @Nullable Function<I, Optional<R>> second) {
+        if (second == null) return input -> first.apply(input).orElse(null);
+        if (first == null) return input -> second.apply(input).orElse(null);
         return input -> first.apply(input).orElseGet(() -> second.apply(input).orElse(null));
     }
+
     @Override
     protected Class<?> loadClass(String name, boolean resolve) throws ClassNotFoundException {
         synchronized (getClassLoadingLock(name)) {
@@ -107,6 +118,19 @@ public class TransformingClassLoader extends ClassLoader implements ITransformin
                 } catch (ClassNotFoundException | SecurityException e1) {
                     e1.addSuppressed(e);
                     LOGGER.trace(CLASSLOADING, "Parent classloader error on {}", name, e);
+
+                    // Mohist start - Try to load class from child classloaders (Allow to use PluginClassLoader)
+                    for (ClassLoader child : child) {
+                        try {
+                            Method find = child.getClass().getDeclaredMethod("findClass", String.class);
+                            find.setAccessible(true);
+                            return (Class<?>) find.invoke(child, name);
+                        } catch (Exception e2) {
+                            e2.printStackTrace();
+                        }
+                    }
+                    // Mohist end
+
                     throw e1;
                 }
             }
@@ -127,7 +151,7 @@ public class TransformingClassLoader extends ClassLoader implements ITransformin
         return (Class<T>) super.defineClass(name, bytes, 0, bytes.length);
     }
 
-    public Class<?> loadClass(String name, Function<String,Enumeration<URL>> classBytesFinder) throws ClassNotFoundException {
+    public Class<?> loadClass(String name, Function<String, Enumeration<URL>> classBytesFinder) throws ClassNotFoundException {
         final Class<?> existingClass = getLoadedClass(name);
         if (existingClass != null) {
             LOGGER.trace(CLASSLOADING, "Found existing class {}", name);
@@ -198,7 +222,7 @@ public class TransformingClassLoader extends ClassLoader implements ITransformin
     }
 
     protected Enumeration<URL> locateResource(String path) {
-        return LamdbaExceptionUtils.uncheck(()->delegatedClassLoader.findResources(path));
+        return LamdbaExceptionUtils.uncheck(() -> delegatedClassLoader.findResources(path));
     }
 
     private static class DelegatedClassLoader extends URLClassLoader {
@@ -232,13 +256,14 @@ public class TransformingClassLoader extends ClassLoader implements ITransformin
             return EnumerationHelper.firstElementOrNull(byteFinder.apply(name));
         }
 
-        public Enumeration<URL> findResources(final String name, Function<String,Enumeration<URL>> byteFinder) {
+        public Enumeration<URL> findResources(final String name, Function<String, Enumeration<URL>> byteFinder) {
             return byteFinder.apply(name);
         }
 
-        protected Map.Entry<byte[], CodeSource> findClass(final String name, Function<String,Enumeration<URL>> classBytesFinder, final String reason) throws ClassNotFoundException {
+        protected Map.Entry<byte[], CodeSource> findClass(final String name, Function<String, Enumeration<URL>> classBytesFinder, final String reason) throws ClassNotFoundException {
             final String path = name.replace('.', '/').concat(".class");
-            final URL classResource = EnumerationHelper.firstElementOrNull(classBytesFinder.apply(path));;
+            final URL classResource = EnumerationHelper.firstElementOrNull(classBytesFinder.apply(path));
+            ;
             byte[] classBytes;
             CodeSource codeSource = null;
             Manifest jarManifest = null;
@@ -256,8 +281,8 @@ public class TransformingClassLoader extends ClassLoader implements ITransformin
                     jarManifest = urlConnection.getJarManifest();
                     baseURL = urlConnection.getBaseUrl();
                 } catch (IOException e) {
-                    LOGGER.trace(CLASSLOADING,"Failed to load bytes for class {} at {} reason {}", name, classResource, reason, e);
-                    throw new ClassNotFoundException("Failed to find class bytes for "+name, e);
+                    LOGGER.trace(CLASSLOADING, "Failed to load bytes for class {} at {} reason {}", name, classResource, reason, e);
+                    throw new ClassNotFoundException("Failed to find class bytes for " + name, e);
                 }
             } else {
                 classBytes = new byte[0];
@@ -283,8 +308,7 @@ public class TransformingClassLoader extends ClassLoader implements ITransformin
             }
         }
 
-        Package tryDefinePackage(String name, @Nullable Manifest man) throws IllegalArgumentException
-        {
+        Package tryDefinePackage(String name, @Nullable Manifest man) throws IllegalArgumentException {
             if (tcl.getPackage(name) == null) {
                 synchronized (this) {
                     if (tcl.getPackage(name) != null) return tcl.getPackage(name);
